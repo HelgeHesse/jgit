@@ -436,7 +436,7 @@ public class RecursiveMergerTest extends RepositoryTestCase {
 
 		BranchBuilder side = db_t.branch("side");
 		RevCommit s1 = side.commit().parent(m0)
-				.add("f", "1\nx(side)\n2\n3\ny(side)\n")
+				.add("xxx", "1\nx(side)\n2\n3\ny(side)\n")
 				.message("s1").create();
 		RevCommit s2 = side.commit().parent(m1)
 				.add("f", "1\nx(side)\n2\n3\ny(side-again)\n")
