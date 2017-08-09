@@ -114,6 +114,7 @@ public class AddCommandTest extends RepositoryTestCase {
 					indexState(CONTENT));
 		}
 	}
+
 	@Test
 	public void testAddNothing() throws GitAPIException {
 		try (Git git = new Git(db)) {
