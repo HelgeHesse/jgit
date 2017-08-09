@@ -97,6 +97,23 @@ public class AddCommandTest extends RepositoryTestCase {
 		super.setUp();
 	}
 
+
+	@Test
+	public void testHH1AddExistingSingleFile() throws IOException, GitAPIException {
+		File file = new File(db.getWorkTree(), "a.txt");
+		FileUtils.createNewFile(file);
+		PrintWriter writer = new PrintWriter(file);
+		writer.print("content");
+		writer.close();
+
+		try (Git git = new Git(db)) {
+			git.add().addFilepattern("a.txt").call();
+
+			assertEquals(
+					"[a.txt, mode:100644, content:content]",
+					indexState(CONTENT));
+		}
+	}
 	@Test
 	public void testAddNothing() throws GitAPIException {
 		try (Git git = new Git(db)) {
