@@ -2,6 +2,7 @@
  * Copyright (C) 2010, Christian Halstrick <christian.halstrick@sap.com>,
  * Copyright (C) 2010-2012, Matthias Sohn <matthias.sohn@sap.com>
  * Copyright (C) 2012, Research In Motion Limited
+ * Copyright (C) 2017, Obeo (mathieu.cartaud@obeo.fr)
  * and other copyright owners as documented in the project's IP log.
  *
  * This program and the accompanying materials are made available
@@ -67,6 +68,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
+import org.eclipse.jgit.attributes.Attributes;
 import org.eclipse.jgit.diff.DiffAlgorithm;
 import org.eclipse.jgit.diff.DiffAlgorithm.SupportedAlgorithm;
 import org.eclipse.jgit.diff.RawText;
@@ -77,18 +79,22 @@ import org.eclipse.jgit.dircache.DirCacheBuildIterator;
 import org.eclipse.jgit.dircache.DirCacheBuilder;
 import org.eclipse.jgit.dircache.DirCacheCheckout;
 import org.eclipse.jgit.dircache.DirCacheEntry;
+import org.eclipse.jgit.errors.BinaryBlobException;
 import org.eclipse.jgit.errors.CorruptObjectException;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.IndexWriteException;
 import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.errors.NoWorkTreeException;
 import org.eclipse.jgit.lib.Config;
+import org.eclipse.jgit.lib.ConfigConstants;
 import org.eclipse.jgit.lib.FileMode;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectInserter;
+import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevTree;
+import org.eclipse.jgit.storage.pack.PackConfig;
 import org.eclipse.jgit.treewalk.AbstractTreeIterator;
 import org.eclipse.jgit.treewalk.CanonicalTreeParser;
 import org.eclipse.jgit.treewalk.NameConflictTreeWalk;
@@ -270,11 +276,22 @@ public class ResolveMerger extends ThreeWayMerger {
 	 */
 	protected MergeAlgorithm mergeAlgorithm;
 
+	/**
+	 * The size limit (bytes) which controls a file to be stored in {@code Heap} or
+	 * {@code LocalFile} during the merge.
+	 */
+	private int inCoreLimit;
+
 	private static MergeAlgorithm getMergeAlgorithm(Config config) {
 		SupportedAlgorithm diffAlg = config.getEnum(
 				CONFIG_DIFF_SECTION, null, CONFIG_KEY_ALGORITHM,
 				HISTOGRAM);
 		return new MergeAlgorithm(DiffAlgorithm.getAlgorithm(diffAlg));
+	}
+
+	private static int getInCoreLimit(Config config) {
+		return config.getInt(
+				ConfigConstants.CONFIG_MERGE_SECTION, ConfigConstants.CONFIG_KEY_IN_CORE_LIMIT, 10 << 20);
 	}
 
 	private static String[] defaultCommitNames() {
@@ -287,7 +304,9 @@ public class ResolveMerger extends ThreeWayMerger {
 	 */
 	protected ResolveMerger(Repository local, boolean inCore) {
 		super(local);
-		mergeAlgorithm = getMergeAlgorithm(local.getConfig());
+		Config config = local.getConfig();
+		mergeAlgorithm = getMergeAlgorithm(config);
+		inCoreLimit = getInCoreLimit(config);
 		commitNames = defaultCommitNames();
 		this.inCore = inCore;
 
@@ -429,9 +448,10 @@ public class ResolveMerger extends ThreeWayMerger {
 	}
 
 	/**
-	 * Processes one path and tries to merge. This method will do all do all
-	 * trivial (not content) merges and will also detect if a merge will fail.
-	 * The merge will fail when one of the following is true
+	 * Processes one path and tries to merge taking git attributes in account.
+	 * This method will do all trivial (not content) merges and will also detect
+	 * if a merge will fail. The merge will fail when one of the following is
+	 * true
 	 * <ul>
 	 * <li>the index entry does not match the entry in ours. When merging one
 	 * branch into the current HEAD, ours will point to HEAD and theirs will
@@ -463,6 +483,8 @@ public class ResolveMerger extends ThreeWayMerger {
 	 * @param ignoreConflicts
 	 *            see
 	 *            {@link ResolveMerger#mergeTrees(AbstractTreeIterator, RevTree, RevTree, boolean)}
+	 * @param attributes
+	 *            the attributes defined for this entry
 	 * @return <code>false</code> if the merge will fail because the index entry
 	 *         didn't match ours or the working-dir file was dirty and a
 	 *         conflict occurred
@@ -470,12 +492,12 @@ public class ResolveMerger extends ThreeWayMerger {
 	 * @throws IncorrectObjectTypeException
 	 * @throws CorruptObjectException
 	 * @throws IOException
-	 * @since 3.5
+	 * @since 4.9
 	 */
 	protected boolean processEntry(CanonicalTreeParser base,
 			CanonicalTreeParser ours, CanonicalTreeParser theirs,
 			DirCacheBuildIterator index, WorkingTreeIterator work,
-			boolean ignoreConflicts)
+			boolean ignoreConflicts, Attributes attributes)
 			throws MissingObjectException, IncorrectObjectTypeException,
 			CorruptObjectException, IOException {
 		enterSubtree = true;
@@ -627,7 +649,8 @@ public class ResolveMerger extends ThreeWayMerger {
 				return false;
 
 			// Don't attempt to resolve submodule link conflicts
-			if (isGitLink(modeO) || isGitLink(modeT)) {
+			if (isGitLink(modeO) || isGitLink(modeT)
+					|| !attributes.canBeContentMerged()) {
 				add(tw.getRawPath(), base, DirCacheEntry.STAGE_1, 0, 0);
 				add(tw.getRawPath(), ours, DirCacheEntry.STAGE_2, 0, 0);
 				add(tw.getRawPath(), theirs, DirCacheEntry.STAGE_3, 0, 0);
@@ -636,8 +659,9 @@ public class ResolveMerger extends ThreeWayMerger {
 			}
 
 			MergeResult<RawText> result = contentMerge(base, ours, theirs);
-			if (ignoreConflicts)
+			if (ignoreConflicts) {
 				result.setContainsConflicts(false);
+			}
 			updateIndex(base, ours, theirs, result);
 			if (result.containsConflicts() && !ignoreConflicts)
 				unmergedPaths.add(tw.getPathString());
@@ -646,6 +670,7 @@ public class ResolveMerger extends ThreeWayMerger {
 			// OURS or THEIRS has been deleted
 			if (((modeO != 0 && !tw.idEqual(T_BASE, T_OURS)) || (modeT != 0 && !tw
 					.idEqual(T_BASE, T_THEIRS)))) {
+				MergeResult<RawText> result = contentMerge(base, ours, theirs);
 
 				add(tw.getRawPath(), base, DirCacheEntry.STAGE_1, 0, 0);
 				add(tw.getRawPath(), ours, DirCacheEntry.STAGE_2, 0, 0);
@@ -666,8 +691,7 @@ public class ResolveMerger extends ThreeWayMerger {
 				unmergedPaths.add(tw.getPathString());
 
 				// generate a MergeResult for the deleted file
-				mergeResults.put(tw.getPathString(),
-						contentMerge(base, ours, theirs));
+				mergeResults.put(tw.getPathString(), result);
 			}
 		}
 		return true;
@@ -688,12 +712,22 @@ public class ResolveMerger extends ThreeWayMerger {
 	private MergeResult<RawText> contentMerge(CanonicalTreeParser base,
 			CanonicalTreeParser ours, CanonicalTreeParser theirs)
 			throws IOException {
-		RawText baseText = base == null ? RawText.EMPTY_TEXT : getRawText(
+		RawText baseText;
+		RawText ourText;
+		RawText theirsText;
+
+		try {
+			baseText = base == null ? RawText.EMPTY_TEXT : getRawText(
 				base.getEntryObjectId(), reader);
-		RawText ourText = ours == null ? RawText.EMPTY_TEXT : getRawText(
+			ourText = ours == null ? RawText.EMPTY_TEXT : getRawText(
 				ours.getEntryObjectId(), reader);
-		RawText theirsText = theirs == null ? RawText.EMPTY_TEXT : getRawText(
+			theirsText = theirs == null ? RawText.EMPTY_TEXT : getRawText(
 				theirs.getEntryObjectId(), reader);
+		} catch (BinaryBlobException e) {
+			MergeResult<RawText> r = new MergeResult<>(Collections.<RawText>emptyList());
+			r.setContainsConflicts(true);
+			return r;
+		}
 		return (mergeAlgorithm.merge(RawTextComparator.DEFAULT, baseText,
 				ourText, theirsText));
 	}
@@ -760,6 +794,7 @@ public class ResolveMerger extends ThreeWayMerger {
 			MergeResult<RawText> result) throws FileNotFoundException,
 			IOException {
 		File mergedFile = !inCore ? writeMergedFile(result) : null;
+
 		if (result.containsConflicts()) {
 			// A conflict occurred, the file will contain conflict markers
 			// the index will be populated with the three stages and the
@@ -827,7 +862,7 @@ public class ResolveMerger extends ThreeWayMerger {
 	private ObjectId insertMergeResult(MergeResult<RawText> result)
 			throws IOException {
 		TemporaryBuffer.LocalFile buf = new TemporaryBuffer.LocalFile(
-				db != null ? nonNullRepo().getDirectory() : null, 10 << 20);
+				db != null ? nonNullRepo().getDirectory() : null, inCoreLimit);
 		try {
 			new MergeFormatter().formatMerge(buf, result,
 					Arrays.asList(commitNames), CHARACTER_ENCODING);
@@ -869,10 +904,13 @@ public class ResolveMerger extends ThreeWayMerger {
 	}
 
 	private static RawText getRawText(ObjectId id, ObjectReader reader)
-			throws IOException {
+			throws IOException, BinaryBlobException {
 		if (id.equals(ObjectId.zeroId()))
 			return new RawText(new byte[] {});
-		return new RawText(reader.open(id, OBJ_BLOB).getCachedBytes());
+
+		ObjectLoader loader = reader.open(id, OBJ_BLOB);
+		int threshold = PackConfig.DEFAULT_BIG_FILE_THRESHOLD;
+		return RawText.load(loader, threshold);
 	}
 
 	private static boolean nonTree(final int mode) {
@@ -1091,6 +1129,8 @@ public class ResolveMerger extends ThreeWayMerger {
 	protected boolean mergeTreeWalk(TreeWalk treeWalk, boolean ignoreConflicts)
 			throws IOException {
 		boolean hasWorkingTreeIterator = tw.getTreeCount() > T_FILE;
+		boolean hasAttributeNodeProvider = treeWalk
+				.getAttributesNodeProvider() != null;
 		while (treeWalk.next()) {
 			if (!processEntry(
 					treeWalk.getTree(T_BASE, CanonicalTreeParser.class),
@@ -1098,7 +1138,9 @@ public class ResolveMerger extends ThreeWayMerger {
 					treeWalk.getTree(T_THEIRS, CanonicalTreeParser.class),
 					treeWalk.getTree(T_INDEX, DirCacheBuildIterator.class),
 					hasWorkingTreeIterator ? treeWalk.getTree(T_FILE,
-							WorkingTreeIterator.class) : null, ignoreConflicts)) {
+							WorkingTreeIterator.class) : null,
+					ignoreConflicts, hasAttributeNodeProvider
+							? treeWalk.getAttributes() : new Attributes())) {
 				cleanUp();
 				return false;
 			}
