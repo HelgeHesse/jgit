@@ -7,5 +7,5 @@ bazel-jgit
 bazel-out
 bazel-testlogs
 *~
-/.idea/*
+/.idea
 *.iml
