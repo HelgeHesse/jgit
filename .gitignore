@@ -5,4 +5,3 @@ infer-out
 bazel-*
 *~
 /.idea
-*.iml
